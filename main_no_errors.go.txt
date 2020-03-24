@@ -1,0 +1,129 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"io/ioutil"
+	"net/http"
+	"sync"
+
+	log "github.com/sirupsen/logrus"
+)
+
+const (
+	url = "https://api.binance.com/api/v3/avgPrice?symbol=ETHBTC"
+)
+
+func createOrder(ctx context.Context, cancel context.CancelFunc, orderID int, ch chan<- string, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	log.WithFields(log.Fields{
+		"orderID": orderID,
+	}).Info("start to create order")
+
+	select {
+	case <-ctx.Done(): // before start creating the order we check if it was not already cancelled
+		log.WithFields(log.Fields{
+			"orderID": orderID,
+		}).Warn("cancelled request")
+		return
+	default: // creates the order
+		resp, err := http.Get("https://api.binance.com/api/v3/avgPrice?symbol=ETHBTC")
+		if err != nil {
+			log.WithFields(log.Fields{
+				"orderID": orderID,
+			}).WithError(err).Error("err handle it")
+			cancel()
+			return
+		}
+		defer resp.Body.Close()
+		b, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			log.WithFields(log.Fields{
+				"orderID": orderID,
+			}).WithError(err).Error("err handle it")
+			cancel()
+			return
+		}
+
+		// forcing the error here just to see the cancellation
+		if orderID == 4 {
+			err := errors.New("invalid order number")
+			log.WithFields(log.Fields{
+				"orderID": orderID,
+			}).WithError(err).Error("invalid order")
+			cancel()
+			return
+		}
+
+		ch <- string(b)
+
+		log.WithFields(log.Fields{
+			"orderID": orderID,
+		}).Info("order created")
+	}
+}
+
+func main() {
+	log.Info("started")
+
+	ctx := context.Background()
+	ctx, cancel := context.WithCancel(ctx)
+
+	orders := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+	log.WithFields(log.Fields{
+		"orders": orders,
+	}).Info("creating orders")
+
+	var wg sync.WaitGroup
+	ch := make(chan string)
+	var responses []string
+
+	// create the orders - all the goroutines will be blocked until someone reads the channel
+	// or someone closes the channel
+	for _, orderID := range orders {
+		wg.Add(1)
+		go createOrder(ctx, cancel, orderID, ch, &wg)
+	}
+
+	// separate goroutine to wait all WaitGroups to finish and close the channels
+	// this is not blocking the Main since it's a separate goroutine
+	go func() {
+		wg.Wait()
+		log.Info("closing channels")
+		close(ch)
+	}()
+
+	// this is where we read the channels and it is a blocking operation too
+	// if there is nothing to read, it will block until this happens
+	// infinity loop until we close the channels or the error happens
+	channelIsOpen := true
+	for channelIsOpen {
+		select {
+		case response, ok := <-ch:
+			if !ok {
+				log.Info("response channel is closed")
+				channelIsOpen = false
+				break
+			}
+
+			log.WithFields(log.Fields{
+				"response": response,
+			}).Info("appending response")
+			responses = append(responses, response)
+
+		case <-ctx.Done():
+			log.Error("error happened - cancelling")
+			channelIsOpen = false
+		}
+	}
+
+	// some final processing with the results - whatever
+	for _, r := range responses {
+		log.WithFields(log.Fields{
+			"response": r,
+		}).Info("received response")
+	}
+
+	log.Info("done!")
+}
